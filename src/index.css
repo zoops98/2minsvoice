@@ -1,0 +1,18 @@
+@import url('https://fonts.googleapis.com/css2?family=Cormorant+Garamond:wght@400;500;600;700&family=Inter:wght@400;500;600;700&family=Libre+Baskerville:ital,wght@0,400;0,700;1,400&display=swap');
+@import "tailwindcss";
+
+@theme {
+  --font-sans: "Inter", ui-sans-serif, system-ui, sans-serif;
+  --font-serif: "Cormorant Garamond", serif;
+  --font-display: "Libre Baskerville", serif;
+  
+  --color-olive: #5A5A40;
+  --color-olive-dark: #4A4A35;
+  --color-paper: #F5F5F0;
+}
+
+@layer base {
+  body {
+    @apply bg-paper text-[#1A1A1A] font-sans;
+  }
+}

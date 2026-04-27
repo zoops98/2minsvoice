@@ -1,5 +1,5 @@
 {
-  "name": "2분강의",
-  "description": "이미지나 마크다운 파일을 업로드하여 2분 또는 3분 분량의 팟캐스트 스타일 음성 강의를 생성합니다. 개발자: Zoops",
+  "name": "2분강의 모고강의 포함",
+  "description": "이미지, 마크다운 또는 HTML 필기노트를 업로드하여 2~3분 분량의 팟캐스트 또는 1인 필기 핵심 강의 음성을 생성합니다. 개발자: ZoopsBooks",
   "requestFramePermissions": []
 }

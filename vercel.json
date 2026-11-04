@@ -1,0 +1,6 @@
+{
+  "framework": null,
+  "installCommand": "",
+  "buildCommand": "node -e \"const fs=require('fs');fs.mkdirSync('public-single',{recursive:true});fs.copyFileSync('index.html','public-single/index.html')\"",
+  "outputDirectory": "public-single"
+}

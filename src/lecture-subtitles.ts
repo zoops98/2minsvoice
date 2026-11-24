@@ -11,6 +11,7 @@ type TranscriptResponse = {
 const MAX_AUDIO_BYTES = 120 * PCM_BYTES_PER_SECOND;
 const LINE_WIDTH = 24;
 const RECHECK_GAP_SECONDS = 1.8;
+class TimestampError extends Error {}
 
 function formatTime(seconds: number) {
   const ms = Math.round(seconds * 1000);
@@ -44,10 +45,8 @@ function readWords(result: TranscriptResponse, duration: number): TimedWord[] {
       }
     }
   }
-  if (!words.length || invalid > Math.max(2, words.length * 0.02)
-    || words[0].start > Math.min(10, duration * 0.30)
-    || duration - words[words.length - 1].end > Math.min(10, duration * 0.30)) {
-    throw new Error('음성 인식 결과에 자막 시간 정보가 부족합니다.');
+  if (!words.length || invalid > Math.max(8, words.length * 0.20)) {
+    throw new TimestampError('음성 인식 결과에 자막 시간 정보가 부족합니다.');
   }
   return words;
 }
@@ -115,7 +114,7 @@ function samplesBetween(pcm: Uint8Array, start: number, end: number) {
   return pcm.subarray(byteAt(start), byteAt(end));
 }
 
-function hasSpeech(pcm: Uint8Array, start: number, end: number) {
+function hasSpeech(pcm: Uint8Array, start: number, end: number, minimumActiveSeconds = 0.36) {
   const slice = samplesBetween(pcm, start, end);
   const samples = new DataView(slice.buffer, slice.byteOffset, slice.byteLength);
   const frameBytes = PCM_BYTES_PER_SECOND / 50;
@@ -131,7 +130,7 @@ function hasSpeech(pcm: Uint8Array, start: number, end: number) {
     }
     if (Math.sqrt(power / (frameBytes / 8)) >= 400) active++;
   }
-  return active >= Math.max(18, frames * 0.22);
+  return active >= Math.max(Math.ceil(minimumActiveSeconds * 50), frames * 0.22);
 }
 
 function spokenGaps(words: TimedWord[], pcm: Uint8Array) {
@@ -150,11 +149,46 @@ function spokenGaps(words: TimedWord[], pcm: Uint8Array) {
   return gaps;
 }
 
+function quietSplit(pcm: Uint8Array, approximate: number) {
+  for (const offset of [0, -0.2, 0.2, -0.4, 0.4, -0.6, 0.6, -0.8, 0.8]) {
+    const point = approximate + offset;
+    if (point >= 0.1 && point + 0.1 < pcm.byteLength / PCM_BYTES_PER_SECOND
+      && !hasSpeech(pcm, point - 0.06, point + 0.06, 0.02)) return point;
+  }
+  return approximate;
+}
+
+async function transcribeWithSplit(apiKey: string, pcm: Uint8Array, depth = 0): Promise<TimedWord[]> {
+  const duration = pcm.length / PCM_BYTES_PER_SECOND;
+  try {
+    return await transcribe(apiKey, [pcm], duration);
+  } catch (error) {
+    if (!(error instanceof TimestampError)) throw error;
+    if (duration < 8 || depth >= 2) return [];
+    const split = quietSplit(pcm, duration / 2);
+    const first = samplesBetween(pcm, 0, split);
+    const offset = first.byteLength / PCM_BYTES_PER_SECOND;
+    const left = await transcribeWithSplit(apiKey, first, depth + 1);
+    const right = await transcribeWithSplit(apiKey, pcm.subarray(first.byteLength), depth + 1);
+    return [...left, ...right.map(word => ({ ...word, start: word.start + offset, end: word.end + offset }))];
+  }
+}
+
 async function recoverMissingSpeech(apiKey: string, words: TimedWord[], pcm: Uint8Array, onRetry: () => void) {
   const recovered: TimedWord[] = [];
   const paddingSeconds = 0.25;
   const pad = new Uint8Array(paddingSeconds * PCM_BYTES_PER_SECOND);
-  for (const gap of spokenGaps(words, pcm).slice(0, 12)) {
+  const clips: { start: number; end: number }[] = [];
+  for (const gap of spokenGaps(words, pcm)) {
+    let start = gap.start;
+    while (gap.end - start > 22) {
+      const end = quietSplit(pcm, start + 20);
+      clips.push({ start, end });
+      start = end;
+    }
+    clips.push({ start, end: gap.end });
+  }
+  for (const gap of clips.slice(0, 12)) {
     onRetry();
     const clip = samplesBetween(pcm, gap.start, gap.end);
     try {
@@ -194,8 +228,8 @@ export async function generateSyncedSrt(
   let missedSpans = 0;
   for (const [index, batch] of batches.entries()) {
     onProgress(`음성과 자막 맞추는 중… (${index + 1}/${batches.length})`);
-    const words = await transcribe(apiKey, batch.parts, batch.bytes / PCM_BYTES_PER_SECOND);
     const pcm = makeLectureWav(batch.parts).subarray(44);
+    const words = await transcribeWithSplit(apiKey, pcm);
     const recovered = await recoverMissingSpeech(apiKey, words, pcm, () => {
       onProgress(`자막이 빠진 발화 다시 확인 중… (${index + 1}/${batches.length})`);
     });

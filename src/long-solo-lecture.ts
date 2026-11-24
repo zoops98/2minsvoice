@@ -138,14 +138,14 @@ ${covered || '(없음)'}`;
     });
     let duration = clips.reduce((sum, clip) => sum + clip.byteLength, 0) / PCM_BYTES_PER_SECOND;
 
-    if (section.title === '어휘와 해석') {
+    for (let supplementIndex = 0; section.title === '어휘와 해석' && supplementIndex < 2; supplementIndex++) {
       const gapSeconds = targetSeconds - (elapsed + duration) - targetSeconds * SECTIONS[3].share;
-      if (gapSeconds > 20) {
-        onProgress('남은 시간에 맞춰 새 원문 풀이 확인 중…');
-        const targetExtra = Math.min(gapSeconds, 150);
-        const measuredPace = (spokenUnits + speechUnits(text)) / (elapsed + duration);
-        const extraChars = Math.round(targetExtra * measuredPace * 1.25);
-        const extraPrompt = `${prompt}
+      if (gapSeconds <= 20) break;
+      onProgress('남은 시간에 맞춰 새 원문 풀이 확인 중…');
+      const targetExtra = Math.min(gapSeconds, 150);
+      const measuredPace = (spokenUnits + speechUnits(text)) / (elapsed + duration);
+      const extraChars = Math.round(targetExtra * measuredPace * 1.25);
+      const extraPrompt = `${prompt}
 
 이제 아래까지 이미 녹음했습니다. 뒤에 붙일 새로운 해석 설명만 약 ${Math.round(targetExtra)}초(공백 포함 약 ${extraChars}자)로 작성하세요.
 이미 다룬 지문 문장, 표현의 뜻, 문장 구조, 사건, 중심 주장을 다시 풀이하거나 인용하지 마세요.
@@ -153,22 +153,21 @@ ${covered || '(없음)'}`;
 
 이미 녹음한 이 구간 대본:
 ${text}`;
-        let supplement: Awaited<ReturnType<typeof writeSection>> | undefined;
-        try {
-          supplement = await writeSection(extraPrompt);
-        } catch (error) {
-          console.warn('추가 해석 대본 생성 실패', error);
-        }
-        if (supplement?.text && !/^보강할 내용 없음[.!]?\s*$/.test(supplement.text)) {
-          const extraClips = await generateLectureAudio(apiKey, [{ speaker: '선생님', text: supplement.text }], (part, total) => {
-            onProgress(`새 원문 해석 음성 생성 중… (${part}/${total})`);
-          });
-          text += ` ${supplement.text}`;
-          clips.push(...extraClips);
-          duration += extraClips.reduce((sum, clip) => sum + clip.byteLength, 0) / PCM_BYTES_PER_SECOND;
-          spoken = supplement.seen;
-        }
+      let supplement: Awaited<ReturnType<typeof writeSection>> | undefined;
+      try {
+        supplement = await writeSection(extraPrompt);
+      } catch (error) {
+        console.warn('추가 해석 대본 생성 실패', error);
       }
+      if (supplement?.text && !/^보강할 내용 없음[.!]?\s*$/.test(supplement.text)) {
+        const extraClips = await generateLectureAudio(apiKey, [{ speaker: '선생님', text: supplement.text }], (part, total) => {
+          onProgress(`새 원문 해석 음성 생성 중… (${part}/${total})`);
+        });
+        text += ` ${supplement.text}`;
+        clips.push(...extraClips);
+        duration += extraClips.reduce((sum, clip) => sum + clip.byteLength, 0) / PCM_BYTES_PER_SECOND;
+        spoken = supplement.seen;
+      } else break;
     }
     audioParts.push(...clips);
     sections.push({ title: section.title, text, seconds: duration });

@@ -10,6 +10,7 @@ type TranscriptResponse = {
 
 const MAX_AUDIO_BYTES = 120 * PCM_BYTES_PER_SECOND;
 const LINE_WIDTH = 24;
+const RECHECK_GAP_SECONDS = 1.8;
 
 function formatTime(seconds: number) {
   const ms = Math.round(seconds * 1000);
@@ -109,6 +110,69 @@ async function transcribe(apiKey: string, pcm: Uint8Array[], duration: number) {
   return readWords(result, duration);
 }
 
+function samplesBetween(pcm: Uint8Array, start: number, end: number) {
+  const byteAt = (seconds: number) => Math.round(seconds * PCM_BYTES_PER_SECOND / 2) * 2;
+  return pcm.subarray(byteAt(start), byteAt(end));
+}
+
+function hasSpeech(pcm: Uint8Array, start: number, end: number) {
+  const slice = samplesBetween(pcm, start, end);
+  const samples = new DataView(slice.buffer, slice.byteOffset, slice.byteLength);
+  const frameBytes = PCM_BYTES_PER_SECOND / 50;
+  let active = 0;
+  const frames = Math.floor(samples.byteLength / frameBytes);
+  for (let frame = 0; frame < frames; frame++) {
+    const first = frame * frameBytes;
+    let power = 0;
+    // An RMS estimate on one sample in four is sufficient for finding voiced gaps.
+    for (let i = first; i < first + frameBytes; i += 8) {
+      const value = samples.getInt16(i, true);
+      power += value * value;
+    }
+    if (Math.sqrt(power / (frameBytes / 8)) >= 400) active++;
+  }
+  return active >= Math.max(18, frames * 0.22);
+}
+
+function spokenGaps(words: TimedWord[], pcm: Uint8Array) {
+  const gaps: { start: number; end: number }[] = [];
+  let lastEnd = 0;
+  const check = (end: number) => {
+    if (end - lastEnd >= RECHECK_GAP_SECONDS && hasSpeech(pcm, lastEnd, end)) {
+      gaps.push({ start: lastEnd, end });
+    }
+  };
+  for (const word of words) {
+    check(word.start);
+    lastEnd = Math.max(lastEnd, word.end);
+  }
+  check(pcm.length / PCM_BYTES_PER_SECOND);
+  return gaps;
+}
+
+async function recoverMissingSpeech(apiKey: string, words: TimedWord[], pcm: Uint8Array, onRetry: () => void) {
+  const recovered: TimedWord[] = [];
+  const paddingSeconds = 0.25;
+  const pad = new Uint8Array(paddingSeconds * PCM_BYTES_PER_SECOND);
+  for (const gap of spokenGaps(words, pcm).slice(0, 12)) {
+    onRetry();
+    const clip = samplesBetween(pcm, gap.start, gap.end);
+    try {
+      const reply = await transcribe(apiKey, [pad, clip, pad], clip.length / PCM_BYTES_PER_SECOND + 2 * paddingSeconds);
+      const offset = gap.start - paddingSeconds;
+      for (const word of reply) {
+        const start = Math.max(gap.start, word.start + offset);
+        const end = Math.min(gap.end, word.end + offset);
+        if (end > start) recovered.push({ ...word, start, end });
+      }
+    } catch {
+      // Keep the aligned captions from neighboring speech. Unresolved gaps are reported below.
+    }
+  }
+  const combined = [...words, ...recovered].sort((a, b) => a.start - b.start);
+  return { words: combined, missedSpans: spokenGaps(combined, pcm).length };
+}
+
 export async function generateSyncedSrt(
   apiKey: string,
   audioParts: Uint8Array[],
@@ -127,13 +191,19 @@ export async function generateSyncedSrt(
 
   const cues: ReturnType<typeof makeCues> = [];
   let offsetBytes = 0;
+  let missedSpans = 0;
   for (const [index, batch] of batches.entries()) {
     onProgress(`음성과 자막 맞추는 중… (${index + 1}/${batches.length})`);
     const words = await transcribe(apiKey, batch.parts, batch.bytes / PCM_BYTES_PER_SECOND);
+    const pcm = makeLectureWav(batch.parts).subarray(44);
+    const recovered = await recoverMissingSpeech(apiKey, words, pcm, () => {
+      onProgress(`자막이 빠진 발화 다시 확인 중… (${index + 1}/${batches.length})`);
+    });
     const offset = offsetBytes / PCM_BYTES_PER_SECOND;
-    for (const cue of makeCues(words)) {
+    for (const cue of makeCues(recovered.words)) {
       cues.push({ ...cue, start: cue.start + offset, end: cue.end + offset });
     }
+    missedSpans += recovered.missedSpans;
     offsetBytes += batch.bytes;
   }
 
@@ -145,5 +215,5 @@ export async function generateSyncedSrt(
     blocks.push(`${blocks.length + 1}\r\n${formatTime(cue.start)} --> ${formatTime(end)}\r\n${cue.lines.join('\r\n')}`);
   }
   if (!blocks.length) throw new Error('유효한 자막을 만들지 못했습니다.');
-  return blocks.join('\r\n\r\n') + '\r\n';
+  return { srt: blocks.join('\r\n\r\n') + '\r\n', missedSpans };
 }

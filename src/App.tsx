@@ -207,7 +207,11 @@ export default function App() {
       setAudioDuration(audioBytes / PCM_BYTES_PER_SECOND);
 
       try {
-        setSrtContent(await generateSyncedSrt(apiKey, audioParts, setAudioProgress));
+        const captions = await generateSyncedSrt(apiKey, audioParts, setAudioProgress);
+        setSrtContent(captions.srt);
+        if (captions.missedSpans) {
+          setSubtitleError(`자막에서 발화가 빠졌을 수 있는 구간이 ${captions.missedSpans}곳 있습니다. 영상에 사용하기 전에 확인해 주세요.`);
+        }
       } catch (error) {
         const message = error instanceof Error ? error.message : '음성 인식에 실패했습니다.';
         setSubtitleError(`${message} 음성과 대본은 저장할 수 있습니다.`);

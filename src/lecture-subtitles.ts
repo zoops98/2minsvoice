@@ -1,0 +1,149 @@
+import { makeLectureWav, PCM_BYTES_PER_SECOND } from './lecture-audio';
+
+type TimedWord = { text: string; start: number; end: number };
+type TranscriptResponse = {
+  status?: string;
+  steps?: { type: string; content?: { annotations?: {
+    type: string; text?: string; start_offset?: string; end_offset?: string;
+  }[] }[] }[];
+};
+
+const MAX_AUDIO_BYTES = 120 * PCM_BYTES_PER_SECOND;
+const LINE_WIDTH = 24;
+
+function formatTime(seconds: number) {
+  const ms = Math.round(seconds * 1000);
+  const pair = (value: number) => String(value).padStart(2, '0');
+  return `${pair(Math.floor(ms / 3600000))}:${pair(Math.floor(ms / 60000) % 60)}:${pair(Math.floor(ms / 1000) % 60)},${String(ms % 1000).padStart(3, '0')}`;
+}
+
+function wordOffset(value?: string) {
+  return value && /^\d+(?:\.\d+)?s$/.test(value) ? Number(value.slice(0, -1)) : NaN;
+}
+
+function readWords(result: TranscriptResponse, duration: number): TimedWord[] {
+  const words: TimedWord[] = [];
+  let invalid = 0;
+  for (const step of result.steps ?? []) {
+    if (step.type !== 'model_output') continue;
+    for (const part of step.content ?? []) {
+      for (const annotation of part.annotations ?? []) {
+        if (annotation.type !== 'word_info') continue;
+        const text = annotation.text?.trim().replace(/[\r\n]/g, ' ');
+        const start = wordOffset(annotation.start_offset);
+        const end = wordOffset(annotation.end_offset);
+        const previous = words.at(-1);
+        if (!text || !Number.isFinite(start) || !Number.isFinite(end)
+          || start >= duration || end <= start || end > duration + 0.5
+          || (previous && start < previous.start)) {
+          invalid++;
+          continue;
+        }
+        words.push({ text, start, end: Math.min(end, duration) });
+      }
+    }
+  }
+  if (!words.length || invalid > Math.max(2, words.length * 0.02)
+    || words[0].start > Math.min(10, duration * 0.30)
+    || duration - words[words.length - 1].end > Math.min(10, duration * 0.30)) {
+    throw new Error('음성 인식 결과에 자막 시간 정보가 부족합니다.');
+  }
+  return words;
+}
+
+function makeCues(words: TimedWord[]) {
+  const cues: { start: number; end: number; lines: string[] }[] = [];
+  let lines: string[] = [];
+  let start = 0;
+  let end = 0;
+  const flush = () => {
+    if (lines.length) cues.push({ start, end, lines });
+    lines = [];
+  };
+  for (const word of words) {
+    const lastLine = lines.at(-1) ?? '';
+    const append = lastLine ? `${lastLine} ${word.text}` : word.text;
+    const sentenceEnded = /[.!?。！？]["'”’)]*$/.test(lastLine);
+    if (lines.length && (
+      word.start - end > 0.65
+      || word.end - start > 5.5
+      || (sentenceEnded && end - start >= 1)
+      || (lines.length === 2 && append.length > LINE_WIDTH)
+    )) flush();
+
+    if (!lines.length) {
+      start = word.start;
+      lines.push(word.text);
+    } else if (append.length > LINE_WIDTH) {
+      lines.push(word.text);
+    } else {
+      lines[lines.length - 1] = append;
+    }
+    end = Math.max(end, word.end);
+  }
+  flush();
+  return cues;
+}
+
+async function transcribe(apiKey: string, pcm: Uint8Array[], duration: number) {
+  const wave = makeLectureWav(pcm);
+  const chunks: string[] = [];
+  for (let index = 0; index < wave.length; index += 8192) {
+    chunks.push(String.fromCharCode(...wave.subarray(index, index + 8192)));
+  }
+  const response = await fetch('https://generativelanguage.googleapis.com/v1beta/interactions', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json', 'x-goog-api-key': apiKey },
+    body: JSON.stringify({
+      model: 'gemini-3.5-transcribe',
+      store: false,
+      input: [{ type: 'audio', mime_type: 'audio/wav', data: btoa(chunks.join('')) }],
+      generation_config: {
+        transcription_config: { mode: { type: 'verbatim', timestamp_granularities: ['word'] } },
+      },
+    }),
+  });
+  if (!response.ok) throw new Error(`음성 인식 요청 실패 (HTTP ${response.status})`);
+  const result: TranscriptResponse = await response.json();
+  if (result.status !== 'completed') throw new Error('음성 인식을 완료하지 못했습니다.');
+  return readWords(result, duration);
+}
+
+export async function generateSyncedSrt(
+  apiKey: string,
+  audioParts: Uint8Array[],
+  onProgress: (message: string) => void,
+) {
+  const batches: { parts: Uint8Array[]; bytes: number }[] = [];
+  for (const part of audioParts) {
+    let batch = batches.at(-1);
+    if (!batch || batch.bytes + part.byteLength > MAX_AUDIO_BYTES) {
+      batch = { parts: [], bytes: 0 };
+      batches.push(batch);
+    }
+    batch.parts.push(part);
+    batch.bytes += part.byteLength;
+  }
+
+  const cues: ReturnType<typeof makeCues> = [];
+  let offsetBytes = 0;
+  for (const [index, batch] of batches.entries()) {
+    onProgress(`음성과 자막 맞추는 중… (${index + 1}/${batches.length})`);
+    const words = await transcribe(apiKey, batch.parts, batch.bytes / PCM_BYTES_PER_SECOND);
+    const offset = offsetBytes / PCM_BYTES_PER_SECOND;
+    for (const cue of makeCues(words)) {
+      cues.push({ ...cue, start: cue.start + offset, end: cue.end + offset });
+    }
+    offsetBytes += batch.bytes;
+  }
+
+  const blocks: string[] = [];
+  for (const [index, cue] of cues.entries()) {
+    const nextStart = cues[index + 1]?.start ?? offsetBytes / PCM_BYTES_PER_SECOND;
+    const end = Math.min(cue.end, nextStart);
+    if (Math.round(end * 1000) <= Math.round(cue.start * 1000)) continue;
+    blocks.push(`${blocks.length + 1}\r\n${formatTime(cue.start)} --> ${formatTime(end)}\r\n${cue.lines.join('\r\n')}`);
+  }
+  if (!blocks.length) throw new Error('유효한 자막을 만들지 못했습니다.');
+  return blocks.join('\r\n\r\n') + '\r\n';
+}

@@ -19,8 +19,9 @@ import {
   Volume2
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { generateLectureAudio, PCM_BYTES_PER_SECOND, prepareLecture } from './lecture-audio';
+import { generateLectureAudio, makeLectureWav, PCM_BYTES_PER_SECOND, prepareLecture } from './lecture-audio';
 import { generateLongSoloLecture } from './long-solo-lecture';
+import { generateSyncedSrt } from './lecture-subtitles';
 
 type FileType = 'image' | 'markdown' | 'html' | null;
 type LectureMode = 'podcast' | 'solo';
@@ -42,6 +43,7 @@ export default function App() {
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
   const [script, setScript] = useState<string>('');
   const [srtContent, setSrtContent] = useState<string>('');
+  const [subtitleError, setSubtitleError] = useState('');
   const [isPlaying, setIsPlaying] = useState(false);
   const [progress, setProgress] = useState(0);
   const [audioProgress, setAudioProgress] = useState('');
@@ -124,6 +126,7 @@ export default function App() {
     setAudioUrl(null);
     setScript('');
     setSrtContent('');
+    setSubtitleError('');
     setProgress(0);
     setAudioProgress('');
 
@@ -191,96 +194,26 @@ export default function App() {
               model: "gemini-3-flash-preview",
               contents: [{ parts: [{ text: scriptPrompt }, contentPart] }],
             })).text, lectureMode),
-            sections: [],
             audioParts: null,
           };
 
       setScript(lecture.script);
 
-      // Step 2: Generate SRT Subtitles
-      let sectionEnd = 0;
-      const sectionTimes = lecture.sections.map(({ title, seconds }) => {
-        const start = sectionEnd;
-        sectionEnd += seconds;
-        return `${title}: ${start.toFixed(2)}초부터 ${sectionEnd.toFixed(2)}초까지`;
-      });
-      const srtPrompt = `
-        다음 스크립트를 바탕으로 음성과 정확히 일치하는 .srt 형식의 자막 파일을 생성하세요.
-        
-        규칙:
-        1. ${longSolo
-          ? `실제 음성의 총 길이는 ${sectionEnd.toFixed(2)}초입니다. 아래 구간 시간을 벗어나지 않도록 자막을 배분하세요.\n${sectionTimes.join('\n')}`
-          : `총 길이는 약 ${lectureLength}분 (${lectureLength * 60}초) 내외입니다.`}
-        2. **중요: 각 자막 블록은 반드시 최대 2줄 이내이어야 합니다.** 한 블록에 내용이 많으면 여러 블록으로 나누세요.
-        3. 한국어 일반적인 말하기 속도(1초당 약 3.5자)를 고려하여 시작(00:00:00,000)부터 끝까지 빈틈없이 시간을 배분하세요.
-        4. 문장이 끝나지 않았더라도 자막이 너무 길어지면(한 줄에 약 20자 내외) 적절히 끊어서 다음 블록으로 넘기세요.
-        5. '학생:', '선생님:' 같은 화자 표시와 대괄호 안의 구간 제목은 자막에서 제외하고 실제 대사 내용만 담으세요.
-        
-        스크립트:
-        ${lecture.script}
-        
-        출력 형식: 오직 .srt 파일 내용(순번, 시간대, 텍스트)만 출력하세요.
-      `;
-
-      if (longSolo) setAudioProgress('예상 자막 작성 중…');
-      try {
-        const srtResponse = await ai.models.generateContent({
-          model: "gemini-3-flash-preview",
-          contents: [{ parts: [{ text: srtPrompt }] }],
-        });
-        if (srtResponse.text) setSrtContent(srtResponse.text);
-      } catch (error) {
-        if (!longSolo) throw error;
-        // Keep the completed audio and script if optional subtitles fail.
-        console.warn('예상 자막 생성 실패', error);
-      }
-
       setStatus('generating_audio');
-
       const audioParts = lecture.audioParts ?? await generateLectureAudio(apiKey, lecture.dialogue, (current, total) => {
         setAudioProgress(`음성 생성 중… (${current}/${total})`);
       });
-      const totalBytes = audioParts.reduce((sum, part) => sum + part.length, 0);
-      const bytes = new Uint8Array(totalBytes);
-      let byteOffset = 0;
-      for (const part of audioParts) {
-        bytes.set(part, byteOffset);
-        byteOffset += part.length;
+      const audioBytes = audioParts.reduce((sum, part) => sum + part.byteLength, 0);
+      setAudioDuration(audioBytes / PCM_BYTES_PER_SECOND);
+
+      try {
+        setSrtContent(await generateSyncedSrt(apiKey, audioParts, setAudioProgress));
+      } catch (error) {
+        const message = error instanceof Error ? error.message : '음성 인식에 실패했습니다.';
+        setSubtitleError(`${message} 음성과 대본은 저장할 수 있습니다.`);
       }
-      setAudioDuration(totalBytes / PCM_BYTES_PER_SECOND);
 
-      // Wrap the combined 24 kHz mono PCM samples in one WAV header.
-      const wavHeader = new ArrayBuffer(44);
-      const view = new DataView(wavHeader);
-
-      // RIFF identifier
-      view.setUint32(0, 0x52494646, false); // "RIFF"
-      // file length
-      view.setUint32(4, 36 + bytes.length, true);
-      // RIFF type
-      view.setUint32(8, 0x57415645, false); // "WAVE"
-      // format chunk identifier
-      view.setUint32(12, 0x666d7420, false); // "fmt "
-      // format chunk length
-      view.setUint32(16, 16, true);
-      // sample format (raw PCM)
-      view.setUint16(20, 1, true);
-      // channel count
-      view.setUint16(22, 1, true);
-      // sample rate
-      view.setUint32(24, 24000, true);
-      // byte rate (sample rate * block align)
-      view.setUint32(28, 24000 * 2, true);
-      // block align (channel count * bytes per sample)
-      view.setUint16(32, 2, true);
-      // bits per sample
-      view.setUint16(34, 16, true);
-      // data chunk identifier
-      view.setUint32(36, 0x64617461, false); // "data"
-      // data chunk length
-      view.setUint32(40, bytes.length, true);
-
-      const blob = new Blob([wavHeader, bytes], { type: 'audio/wav' });
+      const blob = new Blob([makeLectureWav(audioParts)], { type: 'audio/wav' });
       const url = URL.createObjectURL(blob);
       setAudioUrl(url);
       setResultSettings({ minutes: lectureLength, mode: lectureMode });
@@ -375,7 +308,7 @@ export default function App() {
           <div>
             <div className="cs-owner">C&amp;S 전용</div>
             <h1 id="cs-hero-title">영어 지문을<br /><span>듣는 강의로.</span></h1>
-            <p>영어 지문과 필기 자료로 수업에 쓸 강의 음성, 대본, 예상 자막을 만듭니다.</p>
+            <p>영어 지문과 필기 자료로 수업에 쓸 강의 음성, 대본, 자막을 만듭니다.</p>
           </div>
           <div className="cs-art" aria-hidden="true">
             <div className="cs-paper"><span /><span /><span /></div>
@@ -524,10 +457,11 @@ export default function App() {
                       className="flex flex-col items-center gap-2 py-4 bg-gray-50 hover:bg-violet-50 hover:text-violet-700 rounded-2xl text-gray-500 font-bold transition-all border border-transparent hover:border-violet-100 disabled:opacity-30 disabled:hover:bg-gray-50 disabled:hover:text-gray-500 disabled:hover:border-transparent"
                     >
                       <FileText className="w-5 h-5" />
-                      <span className="text-sm">예상 자막 저장</span>
+                      <span className="text-sm">음성 기반 자막 저장</span>
                     </button>
                   </div>
                 </div>
+              {subtitleError && <p className="cs-inline-error" role="status">{subtitleError}</p>}
               <audio 
                 ref={audioRef} 
                 src={audioUrl} 
@@ -559,7 +493,7 @@ export default function App() {
         </AnimatePresence>
 
         </div>
-        <footer className="cs-footer"><strong>ZoopsBooks</strong><span>WAV 음성 · TXT 대본 · SRT 예상 자막</span></footer>
+        <footer className="cs-footer"><strong>ZoopsBooks</strong><span>WAV 음성 · TXT 대본 · SRT 자막</span></footer>
       </main>
 
       <dialog className="cs-dialog" ref={settingsRef} aria-labelledby="cs-api-title" onClose={() => setIsSettingsOpen(false)}>

@@ -4,32 +4,35 @@
  */
 
 import React, { useState, useRef, useEffect } from 'react';
-import { GoogleGenAI, Modality } from "@google/genai";
+import { GoogleGenAI } from "@google/genai";
 import { 
-  Mic, 
   Upload, 
   FileText, 
-  Image as ImageIcon, 
   Play, 
   Pause, 
   Loader2, 
   Settings, 
   CheckCircle2, 
   AlertCircle,
-  Clock,
   Download,
   FileDown,
   Volume2
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
+import { generateLectureAudio, PCM_BYTES_PER_SECOND, prepareLecture } from './lecture-audio';
+import { generateLongSoloLecture } from './long-solo-lecture';
 
 type FileType = 'image' | 'markdown' | 'html' | null;
 type LectureMode = 'podcast' | 'solo';
-type LectureLength = 2 | 3 | 5;
+type LectureLength = 2 | 3 | 5 | 10 | 15;
+
+const WAVE_BARS = [7, 14, 22, 13, 28, 46, 62, 42, 30, 45, 72, 91, 64, 46, 30, 21, 39, 57, 72, 49, 26, 36, 22, 11, 18, 9];
 
 export default function App() {
   const [apiKey, setApiKey] = useState<string>(() => localStorage.getItem('zoops_gemini_api_key') || '');
-  const [isSettingsOpen, setIsSettingsOpen] = useState(!apiKey);
+  const [isSettingsOpen, setIsSettingsOpen] = useState(false);
+  const [draftApiKey, setDraftApiKey] = useState('');
+  const settingsRef = useRef<HTMLDialogElement>(null);
   const [file, setFile] = useState<File | null>(null);
   const [fileType, setFileType] = useState<FileType>(null);
   const [lectureLength, setLectureLength] = useState<LectureLength>(2);
@@ -41,6 +44,9 @@ export default function App() {
   const [srtContent, setSrtContent] = useState<string>('');
   const [isPlaying, setIsPlaying] = useState(false);
   const [progress, setProgress] = useState(0);
+  const [audioProgress, setAudioProgress] = useState('');
+  const [audioDuration, setAudioDuration] = useState(0);
+  const [resultSettings, setResultSettings] = useState({ minutes: lectureLength, mode: lectureMode });
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
   useEffect(() => {
@@ -49,9 +55,21 @@ export default function App() {
     }
   }, [apiKey]);
 
+  useEffect(() => {
+    const dialog = settingsRef.current;
+    if (isSettingsOpen && !dialog?.open) {
+      setDraftApiKey(apiKey);
+      dialog?.showModal();
+    } else if (!isSettingsOpen && dialog?.open) {
+      dialog.close();
+    }
+  }, [isSettingsOpen, apiKey]);
+
   const handleFileChange = (e: React.ChangeEvent<HTMLInputElement>) => {
     const selectedFile = e.target.files?.[0];
     if (selectedFile) {
+      setErrorMessage('');
+      if (status === 'error') setStatus('idle');
       setFile(selectedFile);
       if (selectedFile.type.startsWith('image/')) {
         setFileType('image');
@@ -62,6 +80,8 @@ export default function App() {
         // Auto-switch to solo mode if HTML is uploaded as it's likely a mock exam note
         setLectureMode('solo');
       } else {
+        setFile(null);
+        e.target.value = '';
         setFileType(null);
         setErrorMessage('이미지, 마크다운 또는 HTML 파일만 지원합니다.');
       }
@@ -105,6 +125,7 @@ export default function App() {
     setScript('');
     setSrtContent('');
     setProgress(0);
+    setAudioProgress('');
 
     try {
       const ai = new GoogleGenAI({ apiKey });
@@ -128,118 +149,107 @@ export default function App() {
         if (mode === 'solo') {
           if (len === 2) return '약 700자';
           if (len === 3) return '약 1100자';
-          return '약 1800자';
+          return `약 ${len * 360}자`;
         } else {
           if (len === 2) return '약 600자';
           if (len === 3) return '약 950자';
-          return '약 1500자';
+          return `약 ${len * 300}자`;
         }
       };
 
       const scriptPrompt = lectureMode === 'podcast' ? `
         당신은 전문 교육 팟캐스트 작가입니다. 
-        업로드된 내용을 바탕으로 '줍스(학생)'와 '쌤(선생님)'이 대화하는 ${lectureLength}분 분량의 교육용 스크립트를 작성하세요.
+        업로드된 내용을 바탕으로 학생과 선생님이 대화하는 ${lectureLength}분 분량의 교육용 스크립트를 작성하세요.
         
         규칙:
-        1. 형식은 반드시 '줍스: [대사]', '쌤: [대사]' 형식을 반복해야 합니다.
-        2. 줍스는 배우고자 하는 열의가 가득한 학생이며, 쌤은 명확하고 교육적으로 설명해주시는 여성 선생님입니다.
+        1. 각 발화는 새 줄에 '학생: [대사]' 또는 '선생님: [대사]'로 작성하세요. 화자 이름, 별명, 무대 지시, 제목은 넣지 마세요.
+        2. 학생은 궁금한 점을 짧고 자연스럽게 질문하고, 선생님은 명확하게 설명합니다. 대사 안에서도 학생을 이름이나 별명으로 부르지 마세요.
         3. 청취자가 쉽게 이해할 수 있도록 핵심 내용을 대화로 풀어내세요.
         4. ${getTargetChars(lectureLength, 'podcast')} 정도의 분량으로 작성하세요.
         5. 한국어로 작성하세요.
+        6. 첫 대사는 반드시 '선생님: 강의 시작하겠습니다.'로 시작하고 인사, 자기소개, 잡담 없이 바로 본론으로 들어가세요. 이후에는 도입 인사를 반복하지 마세요.
       ` : `
         당신은 전문 수능/내신 영어 강사입니다. 
         업로드된 필기 데이터(HTML/텍스트)를 바탕으로, 학생들에게 핵심 내용을 짚어주는 1인 강의 대본을 작성하세요.
 
         규칙:
-        1. 형식은 반드시 '쌤: [대사]' 형식으로만 구성되어야 합니다. (줍스 등 다른 인물은 등장하지 않습니다)
+        1. 각 발화는 새 줄에 '선생님: [대사]'로 작성하세요. 다른 인물, 이름, 별명, 무대 지시, 제목은 넣지 마세요.
         2. 선생님은 친절하지만 핵심을 정확히 찌르는 명쾌한 어조를 사용합니다.
         3. 자료 내의 구문 분석, 문법 포인트, 주제 및 요약 내용을 빠짐없이 설명에 녹여내세요.
         4. 청취자가 필기 노트를 보고 있다고 가정하고 시각적인 설명(예: "여기 파란색 박스의 핵심 내용을 보시면...")을 곁들이세요.
         5. 분량은 약 ${lectureLength}분 (${getTargetChars(lectureLength, 'solo')})에 해당하도록 한국어로 작성하세요.
         6. 설명이 너무 빠르지 않게, 전문 강사처럼 문장 사이사이에 여유를 두고 차근차근 설명하는 어조로 작성하세요.
+        7. 첫 대사는 반드시 '선생님: 강의 시작하겠습니다.'로 시작하고 인사, 자기소개, 잡담 없이 바로 본론으로 들어가세요. 이후에는 도입 인사를 반복하지 마세요.
       `;
 
-      const scriptResponse = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
-        contents: [
-          { parts: [{ text: scriptPrompt }, contentPart] }
-        ],
-      });
+      const longSolo = lectureMode === 'solo' && (lectureLength === 10 || lectureLength === 15);
+      if (longSolo) setStatus('generating_audio');
+      const lecture = longSolo
+        ? { ...await generateLongSoloLecture(ai, apiKey, contentPart, lectureLength, setAudioProgress), dialogue: [] }
+        : {
+            ...prepareLecture((await ai.models.generateContent({
+              model: "gemini-3-flash-preview",
+              contents: [{ parts: [{ text: scriptPrompt }, contentPart] }],
+            })).text, lectureMode),
+            sections: [],
+            audioParts: null,
+          };
 
-      const scriptContent = scriptResponse.text;
-      if (!scriptContent) throw new Error("스크립트 생성에 실패했습니다.");
-      setScript(scriptContent);
+      setScript(lecture.script);
 
       // Step 2: Generate SRT Subtitles
+      let sectionEnd = 0;
+      const sectionTimes = lecture.sections.map(({ title, seconds }) => {
+        const start = sectionEnd;
+        sectionEnd += seconds;
+        return `${title}: ${start.toFixed(2)}초부터 ${sectionEnd.toFixed(2)}초까지`;
+      });
       const srtPrompt = `
         다음 스크립트를 바탕으로 음성과 정확히 일치하는 .srt 형식의 자막 파일을 생성하세요.
         
         규칙:
-        1. 총 길이는 약 ${lectureLength}분 (${lectureLength * 60}초) 내외입니다.
+        1. ${longSolo
+          ? `실제 음성의 총 길이는 ${sectionEnd.toFixed(2)}초입니다. 아래 구간 시간을 벗어나지 않도록 자막을 배분하세요.\n${sectionTimes.join('\n')}`
+          : `총 길이는 약 ${lectureLength}분 (${lectureLength * 60}초) 내외입니다.`}
         2. **중요: 각 자막 블록은 반드시 최대 2줄 이내이어야 합니다.** 한 블록에 내용이 많으면 여러 블록으로 나누세요.
         3. 한국어 일반적인 말하기 속도(1초당 약 3.5자)를 고려하여 시작(00:00:00,000)부터 끝까지 빈틈없이 시간을 배분하세요.
         4. 문장이 끝나지 않았더라도 자막이 너무 길어지면(한 줄에 약 20자 내외) 적절히 끊어서 다음 블록으로 넘기세요.
-        5. '줍스:', '쌤:' 같은 화자 이름은 자막에서 제외하고 실제 대사 내용만 담으세요.
+        5. '학생:', '선생님:' 같은 화자 표시와 대괄호 안의 구간 제목은 자막에서 제외하고 실제 대사 내용만 담으세요.
         
         스크립트:
-        ${scriptContent}
+        ${lecture.script}
         
         출력 형식: 오직 .srt 파일 내용(순번, 시간대, 텍스트)만 출력하세요.
       `;
 
-      const srtResponse = await ai.models.generateContent({
-        model: "gemini-3-flash-preview",
-        contents: [{ parts: [{ text: srtPrompt }] }],
-      });
-
-      const srtText = srtResponse.text;
-      if (srtText) setSrtContent(srtText);
+      if (longSolo) setAudioProgress('예상 자막 작성 중…');
+      try {
+        const srtResponse = await ai.models.generateContent({
+          model: "gemini-3-flash-preview",
+          contents: [{ parts: [{ text: srtPrompt }] }],
+        });
+        if (srtResponse.text) setSrtContent(srtResponse.text);
+      } catch (error) {
+        if (!longSolo) throw error;
+        // Keep the completed audio and script if optional subtitles fail.
+        console.warn('예상 자막 생성 실패', error);
+      }
 
       setStatus('generating_audio');
 
-      // Step 3: Generate Audio (TTS)
-      const ttsPrompt = lectureMode === 'podcast' 
-        ? `TTS the following conversation between 줍스 and 쌤:\n${scriptContent}`
-        : `Generate a solo teacher lecture based on the following script:\n${scriptContent}`;
-
-      const audioResponse = await ai.models.generateContent({
-        model: "gemini-2.5-flash-preview-tts",
-        contents: [{ parts: [{ text: ttsPrompt }] }],
-        config: {
-          responseModalities: [Modality.AUDIO],
-          speechConfig: {
-            multiSpeakerVoiceConfig: {
-              speakerVoiceConfigs: [
-                {
-                  speaker: '쌤',
-                  voiceConfig: {
-                    prebuiltVoiceConfig: { voiceName: 'Aoede' }
-                  }
-                },
-                {
-                  speaker: '줍스',
-                  voiceConfig: {
-                    prebuiltVoiceConfig: { voiceName: 'Puck' }
-                  }
-                }
-              ]
-            }
-          }
-        }
+      const audioParts = lecture.audioParts ?? await generateLectureAudio(apiKey, lecture.dialogue, (current, total) => {
+        setAudioProgress(`음성 생성 중… (${current}/${total})`);
       });
-
-      const base64Audio = audioResponse.candidates?.[0]?.content?.parts?.[0]?.inlineData?.data;
-      if (!base64Audio) throw new Error("오디오 생성에 실패했습니다.");
-
-      // Convert Base64 to ArrayBuffer
-      const binaryString = atob(base64Audio);
-      const len = binaryString.length;
-      const bytes = new Uint8Array(len);
-      for (let i = 0; i < len; i++) {
-        bytes[i] = binaryString.charCodeAt(i);
+      const totalBytes = audioParts.reduce((sum, part) => sum + part.length, 0);
+      const bytes = new Uint8Array(totalBytes);
+      let byteOffset = 0;
+      for (const part of audioParts) {
+        bytes.set(part, byteOffset);
+        byteOffset += part.length;
       }
+      setAudioDuration(totalBytes / PCM_BYTES_PER_SECOND);
 
-      // Add WAV Header (Gemini TTS returns raw PCM 16-bit Mono 24kHz)
+      // Wrap the combined 24 kHz mono PCM samples in one WAV header.
       const wavHeader = new ArrayBuffer(44);
       const view = new DataView(wavHeader);
 
@@ -273,6 +283,7 @@ export default function App() {
       const blob = new Blob([wavHeader, bytes], { type: 'audio/wav' });
       const url = URL.createObjectURL(blob);
       setAudioUrl(url);
+      setResultSettings({ minutes: lectureLength, mode: lectureMode });
       setStatus('success');
     } catch (error: any) {
       console.error(error);
@@ -306,7 +317,7 @@ export default function App() {
     if (audioUrl) {
       const a = document.createElement('a');
       a.href = audioUrl;
-      a.download = `lecture_${lectureLength}min_${Date.now()}.wav`;
+      a.download = `lecture_${resultSettings.minutes}min_${Date.now()}.wav`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
@@ -319,7 +330,7 @@ export default function App() {
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `script_${lectureLength}min_${Date.now()}.txt`;
+      a.download = `script_${resultSettings.minutes}min_${Date.now()}.txt`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
@@ -333,7 +344,7 @@ export default function App() {
       const url = URL.createObjectURL(blob);
       const a = document.createElement('a');
       a.href = url;
-      a.download = `subtitles_${lectureLength}min_${Date.now()}.srt`;
+      a.download = `subtitles_${resultSettings.minutes}min_${Date.now()}.srt`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
@@ -341,244 +352,126 @@ export default function App() {
     }
   };
 
+  const isGenerating = status === 'analyzing' || status === 'generating_audio';
+
   return (
-    <div className="min-h-screen bg-paper text-[#1A1A1A] font-sans p-4 md:p-8 selection:bg-olive/20">
-      <div className="max-w-2xl mx-auto">
-        {/* Header - Styled like '한장짜리' */}
-        <header className="flex flex-col items-center text-center mb-16 relative">
-          <div className="bg-emerald-600 text-white px-5 py-1.5 rounded-full text-[10px] font-bold uppercase tracking-[0.2em] mb-6 shadow-lg shadow-emerald-200/50 backdrop-blur-sm">
-            CREATED BY ZoopsBooks
+    <div className="cs-app">
+      <header className="cs-header">
+        <div className="cs-shell cs-nav">
+          <div className="cs-brand">
+            <span className="cs-mark" aria-hidden="true">
+              {[9, 16, 22, 14, 8].map(height => <b key={height} style={{ height }} />)}
+            </span>
+            <strong>2분강의</strong>
           </div>
-          <h1 className="text-8xl font-serif font-bold tracking-tighter mb-4 selection:bg-emerald-100">
-            <span className="text-emerald-600 italic mr-3 tabular-nums drop-shadow-sm">{lectureLength}</span>
-            <span className="bg-clip-text text-transparent bg-gradient-to-b from-[#1A1A1A] to-gray-500">분 강의</span>
-          </h1>
-          <p className="text-gray-400 font-serif italic text-xl tracking-tight">줍스의 한장짜리 학습지 프리미엄 강의</p>
-          
-          <button 
-            onClick={() => setIsSettingsOpen(true)}
-            className="absolute right-0 top-1/2 -translate-y-1/2 p-2 hover:bg-white rounded-full transition-all shadow-sm border border-gray-200 bg-white/50"
-          >
-            <Settings className="w-5 h-5 text-gray-600" />
+          <button type="button" className="cs-api" onClick={() => setIsSettingsOpen(true)} disabled={isGenerating}>
+            <Settings aria-hidden="true" /> API 설정
           </button>
-        </header>
+        </div>
+      </header>
 
-        {/* Main Card */}
-        <div className="glass-card rounded-[56px] p-12 mb-12 relative overflow-hidden">
-          <div className="absolute -top-24 -right-24 w-64 h-64 bg-emerald-50 rounded-full blur-3xl opacity-60" />
-          <div className="absolute -bottom-24 -left-24 w-64 h-64 bg-emerald-50 rounded-full blur-3xl opacity-60" />
-          
-          <div className="space-y-12 relative z-10">
-            {/* File Upload */}
-            <div className="space-y-5">
-              <label className="text-[11px] font-bold uppercase tracking-[0.3em] text-gray-400 ml-1">학습 자료 업로드</label>
-              <div 
-                className={`relative group border-2 border-dashed rounded-[40px] p-14 transition-all duration-500 flex flex-col items-center justify-center cursor-pointer overflow-hidden
-                  ${file ? 'border-emerald-300 bg-emerald-50/10' : 'border-gray-100'}`}
-                onClick={() => document.getElementById('fileInput')?.click()}
-              >
-                <input 
-                  id="fileInput"
-                  type="file" 
-                  className="hidden" 
-                  accept="image/*,.md,text/markdown,.html,text/html"
-                  onChange={handleFileChange}
-                />
-                
-                {file ? (
-                  <div className="flex flex-col items-center text-center">
-                    <motion.div 
-                      layoutId="fileTypeIcon"
-                      className="w-20 h-20 bg-emerald-100/50 rounded-[28px] flex items-center justify-center mb-6 shadow-sm border border-emerald-100"
-                    >
-                      {fileType === 'image' && <ImageIcon className="w-9 h-9 text-emerald-600" />}
-                      {fileType === 'markdown' && <FileText className="w-9 h-9 text-emerald-600" />}
-                      {fileType === 'html' && <FileDown className="w-9 h-9 text-emerald-600" />}
-                    </motion.div>
-                    <p className="font-serif font-bold text-2xl text-emerald-950 truncate max-w-[320px] mb-2">{file.name}</p>
-                    <div className="flex items-center gap-2 px-3 py-1 bg-emerald-600 text-white rounded-full text-[10px] font-bold uppercase tracking-widest shadow-lg shadow-emerald-200">
-                      <CheckCircle2 className="w-3 h-3" />
-                      Ready to process
-                    </div>
-                  </div>
-                ) : (
-                  <div className="flex flex-col items-center text-center">
-                    <div className="w-20 h-20 bg-gray-50/80 rounded-[28px] flex items-center justify-center mb-6 group-hover:scale-110 transition-all duration-300 group-hover:bg-emerald-50 group-hover:shadow-lg group-hover:shadow-emerald-100">
-                      <Upload className="w-9 h-9 text-gray-300 group-hover:text-emerald-500" />
-                    </div>
-                    <p className="font-serif font-bold text-2xl text-gray-400 group-hover:text-gray-600 transition-colors">이미지, 마크다운, HTML</p>
-                    <p className="text-xs text-gray-300 font-medium mt-2 tracking-wide">클릭하여 학습 자료를 제공해주세요</p>
-                  </div>
-                )}
-
-                {/* Animated shimmer on hover when empty */}
-                {!file && (
-                  <div className="absolute inset-0 bg-gradient-to-r from-transparent via-emerald-50/50 to-transparent -translate-x-full group-hover:animate-shimmer" />
-                )}
-              </div>
-            </div>
-
-            {/* Mode & Length Selectors */}
-            <div className="space-y-8">
-              {/* Lecture Mode Selection */}
-              <div className="space-y-4">
-                <label className="text-[11px] font-bold uppercase tracking-[0.2em] text-gray-400 ml-1">강의 스타일 선택</label>
-                <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
-                  {[
-                    { 
-                      id: 'podcast', 
-                      title: '팟캐스트 스타일', 
-                      desc: '학습자와 선생님의 캐주얼한 대화', 
-                      icon: <Mic className="w-5 h-5" />,
-                      tag: '2인 대화'
-                    },
-                    { 
-                      id: 'solo', 
-                      title: '필기 집중 강의', 
-                      desc: '선생님이 혼자서 꼼꼼하게 설명', 
-                      icon: <Volume2 className="w-5 h-5" />,
-                      tag: '1인 설명'
-                    }
-                  ].map((mode) => (
-                    <button
-                      key={mode.id}
-                      onClick={() => {
-                        setLectureMode(mode.id as LectureMode);
-                        if (mode.id === 'podcast' && lectureLength === 5) {
-                          setLectureLength(3);
-                        }
-                      }}
-                      className={`relative overflow-hidden text-left p-6 rounded-[32px] border-2 transition-all duration-300 group
-                        ${lectureMode === mode.id 
-                          ? 'border-emerald-600 bg-emerald-50/30' 
-                          : 'border-gray-100 bg-white hover:border-emerald-200 hover:bg-gray-50/50'}`}
-                    >
-                      <div className="flex justify-between items-start mb-4">
-                        <div className={`p-3 rounded-2xl transition-colors
-                          ${lectureMode === mode.id ? 'bg-emerald-600 text-white' : 'bg-gray-100 text-gray-400 group-hover:text-emerald-500'}`}>
-                          {mode.icon}
-                        </div>
-                        <span className={`text-[9px] font-bold uppercase tracking-widest px-2 py-1 rounded-md
-                          ${lectureMode === mode.id ? 'bg-emerald-100 text-emerald-700' : 'bg-gray-100 text-gray-400'}`}>
-                          {mode.tag}
-                        </span>
-                      </div>
-                      <h4 className={`text-lg font-serif font-bold mb-1 ${lectureMode === mode.id ? 'text-emerald-900' : 'text-gray-900'}`}>
-                        {mode.title}
-                      </h4>
-                      <p className={`text-xs font-medium leading-relaxed ${lectureMode === mode.id ? 'text-emerald-700/70' : 'text-gray-400'}`}>
-                        {mode.desc}
-                      </p>
-                      
-                      {lectureMode === mode.id && (
-                        <motion.div 
-                          layoutId="activeMode"
-                          className="absolute bottom-0 left-0 right-0 h-1 bg-emerald-600"
-                        />
-                      )}
-                    </button>
-                  ))}
-                </div>
-              </div>
-
-              {/* Lecture Length Selection */}
-              <div className="space-y-4">
-                <label className="text-[11px] font-bold uppercase tracking-[0.2em] text-gray-400 ml-1">강의 시간 설정</label>
-                <div className="bg-gray-50/80 p-2 rounded-[32px] border border-gray-100 flex gap-2">
-                  {([2, 3, 5] as const).filter(len => lectureMode === 'solo' || len !== 5).map((len) => (
-                    <button
-                      key={len}
-                      onClick={() => setLectureLength(len)}
-                      className={`relative flex-1 py-4 rounded-[24px] transition-all duration-300 overflow-hidden
-                        ${lectureLength === len 
-                          ? 'bg-white shadow-sm ring-1 ring-gray-100' 
-                          : 'hover:bg-white/50'}`}
-                    >
-                      <div className="relative z-10 flex flex-col items-center">
-                        <div className="flex items-baseline gap-0.5">
-                          <span className={`text-2xl font-serif font-bold tabular-nums transition-colors
-                            ${lectureLength === len ? 'text-emerald-600' : 'text-gray-400'}`}>
-                            {len}
-                          </span>
-                          <span className={`text-xs font-bold transition-colors
-                            ${lectureLength === len ? 'text-emerald-700' : 'text-gray-400'}`}>
-                            분
-                          </span>
-                        </div>
-                        <span className={`text-[8px] font-bold uppercase tracking-[0.2em] transition-colors
-                          ${lectureLength === len ? 'text-emerald-600/60' : 'text-gray-300'}`}>
-                          Duration
-                        </span>
-                      </div>
-                      
-                      {lectureLength === len && (
-                        <motion.div 
-                          layoutId="activeLength"
-                          className="absolute inset-0 bg-white"
-                          transition={{ type: "spring", stiffness: 300, damping: 30 }}
-                        />
-                      )}
-                    </button>
-                  ))}
-                </div>
-              </div>
-            </div>
-
-            {/* Generate Button */}
-            <div className="pt-4">
-              <button
-                onClick={generateLecture}
-                disabled={status === 'analyzing' || status === 'generating_audio'}
-                className={`w-full py-6 rounded-[32px] font-bold text-xl shadow-2xl transition-all flex items-center justify-center gap-4 relative overflow-hidden group
-                  ${status === 'analyzing' || status === 'generating_audio'
-                    ? 'bg-gray-100 text-gray-400 cursor-not-allowed shadow-none'
-                    : 'bg-[#1A1A1A] text-white hover:bg-black active:scale-[0.98] ring-offset-2 focus:ring-2 focus:ring-emerald-500'}`}
-              >
-                {status === 'analyzing' || status === 'generating_audio' ? (
-                  <>
-                    <Loader2 className="w-7 h-7 animate-spin" />
-                    <span className="font-serif italic tracking-wide">
-                      {status === 'analyzing' ? '자료 분석 중...' : '음성 생성 중...'}
-                    </span>
-                  </>
-                ) : (
-                  <>
-                    <Mic className="w-7 h-7 transition-transform group-hover:scale-110" />
-                    <span className="font-serif italic tracking-wide">강의 생성 시작하기</span>
-                  </>
-                )}
-                
-                {status !== 'analyzing' && status !== 'generating_audio' && (
-                  <div className="absolute inset-0 bg-gradient-to-r from-emerald-500/0 via-emerald-500/10 to-emerald-500/0 -translate-x-full group-hover:animate-shimmer" />
-                )}
-              </button>
+      <main className="cs-shell">
+        <section className="cs-hero" aria-labelledby="cs-hero-title">
+          <div>
+            <div className="cs-owner">C&amp;S 전용</div>
+            <h1 id="cs-hero-title">영어 지문을<br /><span>듣는 강의로.</span></h1>
+            <p>영어 지문과 필기 자료로 수업에 쓸 강의 음성, 대본, 예상 자막을 만듭니다.</p>
+          </div>
+          <div className="cs-art" aria-hidden="true">
+            <div className="cs-paper"><span /><span /><span /></div>
+            <div className="cs-wave">
+              {WAVE_BARS.map((height, index) => <span key={index} style={{ height: `${height}%` }} />)}
             </div>
           </div>
+        </section>
+
+        <div className="cs-workspace">
+          <section className="cs-panel" aria-labelledby="cs-source-title">
+            <h2 id="cs-source-title">학습 자료</h2>
+            <p className="cs-lede">강의에 사용할 지문이나 필기 파일을 올려 주세요.</p>
+            <label className="cs-upload">
+              <span className="cs-upload-icon">
+                {fileType ? <CheckCircle2 aria-hidden="true" /> : <Upload aria-hidden="true" />}
+              </span>
+              <strong>{file?.name || '파일 선택'}</strong>
+              <span className="cs-quiet" id="cs-file-types">이미지, HTML, 마크다운</span>
+              <input
+                type="file"
+                accept="image/*,.html,.md,text/html,text/markdown"
+                aria-label="학습 자료 파일 선택"
+                aria-describedby="cs-file-types"
+                onChange={handleFileChange}
+                disabled={isGenerating}
+              />
+            </label>
+            {status !== 'error' && errorMessage && <p className="cs-inline-error" role="alert">{errorMessage}</p>}
+          </section>
+
+          <form className="cs-panel cs-setup" aria-labelledby="cs-config-title" onSubmit={event => {
+            event.preventDefault();
+            if (!isGenerating) void generateLecture();
+          }}>
+            <h2 id="cs-config-title">강의 설정</h2>
+            <fieldset className="cs-field" disabled={isGenerating}>
+              <legend>강의 방식</legend>
+              <div className="cs-mode-list">
+                <label className="cs-choice">
+                  <input type="radio" name="mode" value="podcast" checked={lectureMode === 'podcast'} onChange={() => setLectureMode('podcast')} />
+                  <strong>대화형 팟캐스트</strong><small>학생과 선생님의 대화</small>
+                </label>
+                <label className="cs-choice">
+                  <input type="radio" name="mode" value="solo" checked={lectureMode === 'solo'} onChange={() => setLectureMode('solo')} />
+                  <strong>필기 집중 강의</strong><small>선생님의 1인 설명</small>
+                </label>
+              </div>
+            </fieldset>
+            <fieldset className="cs-field" disabled={isGenerating}>
+              <legend>목표 시간</legend>
+              <div className="cs-durations">
+                {([2, 3, 5, 10, 15] as const).map(minutes => (
+                  <label className="cs-length" key={minutes}>
+                    <input type="radio" name="minutes" value={minutes} checked={lectureLength === minutes} onChange={() => setLectureLength(minutes)} />
+                    {minutes}분
+                  </label>
+                ))}
+              </div>
+            </fieldset>
+            {lectureMode === 'solo' && lectureLength >= 10 && (
+              <p className="cs-plan">주제 → 핵심 문장과 구문 → 어휘와 해석 → 요약</p>
+            )}
+            <button className="cs-run" type="submit" disabled={isGenerating}>
+              {isGenerating ? <Loader2 className="cs-spinner" aria-hidden="true" /> : null}
+              <span role="status">{isGenerating ? (audioProgress || '자료 분석 중…') : `${lectureLength}분 강의 만들기`}</span>
+              {!isGenerating && <span aria-hidden="true">→</span>}
+            </button>
+          </form>
         </div>
 
         {/* Status & Audio Player */}
+        <div className="cs-outcome">
         <AnimatePresence>
           {status === 'success' && audioUrl && (
             <motion.div 
               initial={{ opacity: 0, scale: 0.98, y: 20 }}
               animate={{ opacity: 1, scale: 1, y: 0 }}
-              className="bg-emerald-50/40 backdrop-blur-sm border border-emerald-100/50 rounded-[48px] p-12 flex flex-col items-center text-center shadow-inner"
+              className="bg-violet-50/40 backdrop-blur-sm border border-violet-100/50 rounded-[24px] p-4 sm:p-8 flex flex-col items-center text-center shadow-inner"
             >
-              <div className="w-24 h-24 bg-emerald-600 rounded-[32px] flex items-center justify-center mb-8 shadow-xl shadow-emerald-200 rotate-3">
+              <div className="w-24 h-24 bg-violet-600 rounded-[32px] flex items-center justify-center mb-8 shadow-xl shadow-violet-200 rotate-3">
                 <CheckCircle2 className="w-12 h-12 text-white -rotate-3" />
               </div>
-              <h3 className="text-4xl font-serif font-bold text-emerald-900 mb-4 tracking-tight">강의가 완성되었습니다!</h3>
-              <p className="text-emerald-700/70 font-serif italic text-xl mb-12 max-w-sm mx-auto">
-                {lectureMode === 'podcast' ? '줍스와 쌤의 생생한 대화형 강의를 들어보세요.' : '필기 핵심 내용을 짚어주는 1인 집중 강의입니다.'}
+              <h3 className="text-4xl font-serif font-bold text-violet-900 mb-4 tracking-tight">강의가 완성되었습니다!</h3>
+              <p className="text-violet-700/70 font-serif italic text-xl mb-12 max-w-sm mx-auto">
+                {resultSettings.mode === 'podcast' ? '학생과 선생님의 대화형 강의를 들어보세요.' : '필기 핵심 내용을 짚어주는 1인 집중 강의입니다.'}
               </p>
               
-              <div className="w-full bg-white rounded-[40px] p-10 flex flex-col gap-10 shadow-xl shadow-gray-200/50 border border-emerald-50">
+              <div className="w-full bg-white rounded-[24px] p-4 sm:p-8 flex flex-col gap-10 shadow-xl shadow-gray-200/50 border border-violet-50">
                 <div className="flex flex-col items-center gap-8">
                   <button 
                     onClick={togglePlay}
+                    aria-label={isPlaying ? '일시 정지' : '재생'}
                     className="group relative w-24 h-24 flex items-center justify-center transition-all active:scale-95"
                   >
-                    <div className="absolute inset-0 bg-emerald-600 rounded-full shadow-lg group-hover:scale-105 transition-transform" />
+                    <div className="absolute inset-0 bg-violet-600 rounded-full shadow-lg group-hover:scale-105 transition-transform" />
                     <div className="relative z-10 text-white">
                       {isPlaying ? <Pause className="w-10 h-10" /> : <Play className="w-10 h-10 ml-2 shadow-sm" />}
                     </div>
@@ -586,10 +479,10 @@ export default function App() {
                   
                   <div className="w-full text-center">
                     <div className="flex flex-col items-center gap-2 mb-6">
-                      <div className="flex items-center gap-2 px-3 py-1 bg-emerald-50 rounded-full">
-                        <Volume2 className="w-3 h-3 text-emerald-600" />
-                        <span className="text-[10px] font-bold text-emerald-700 uppercase tracking-widest">
-                          {lectureLength}min {lectureMode === 'podcast' ? 'Podcast' : 'Solo Lecture'}
+                      <div className="flex items-center gap-2 px-3 py-1 bg-violet-50 rounded-full">
+                        <Volume2 className="w-3 h-3 text-violet-600" />
+                        <span className="text-[10px] font-bold text-violet-700 uppercase tracking-widest">
+                          목표 {resultSettings.minutes}분 · 실제 {Math.floor(audioDuration / 60)}분 {Math.floor(audioDuration % 60)}초
                         </span>
                       </div>
                       <h4 className="text-lg font-serif font-bold text-gray-800">강의 리플레이</h4>
@@ -597,15 +490,15 @@ export default function App() {
                     
                     <div className="relative h-2 w-full bg-gray-100 rounded-full overflow-hidden mb-2 group cursor-pointer">
                       <div 
-                        className="h-full bg-emerald-500 rounded-full transition-all duration-100 ease-linear relative"
+                        className="h-full bg-violet-500 rounded-full transition-all duration-100 ease-linear relative"
                         style={{ width: `${progress}%` }}
                       >
-                        <div className="absolute right-0 top-1/2 -translate-y-1/2 w-4 h-4 bg-white border-2 border-emerald-600 rounded-full shadow-md scale-0 group-hover:scale-100 transition-transform" />
+                        <div className="absolute right-0 top-1/2 -translate-y-1/2 w-4 h-4 bg-white border-2 border-violet-600 rounded-full shadow-md scale-0 group-hover:scale-100 transition-transform" />
                       </div>
                     </div>
                     <div className="flex justify-between px-1">
                       <span className="text-[10px] font-mono text-gray-400">0:00</span>
-                      <span className="text-[10px] font-mono text-gray-400">{lectureLength}:00</span>
+                      <span className="text-[10px] font-mono text-gray-400">{Math.floor(audioDuration / 60)}:{String(Math.floor(audioDuration % 60)).padStart(2, '0')}</span>
                     </div>
                   </div>
                 </div>
@@ -613,25 +506,25 @@ export default function App() {
                   <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
                     <button 
                       onClick={downloadAudio}
-                      className="flex flex-col items-center gap-2 py-4 bg-gray-50 hover:bg-emerald-50 hover:text-emerald-700 rounded-2xl text-gray-500 font-bold transition-all border border-transparent hover:border-emerald-100"
+                      className="flex flex-col items-center gap-2 py-4 bg-gray-50 hover:bg-violet-50 hover:text-violet-700 rounded-2xl text-gray-500 font-bold transition-all border border-transparent hover:border-violet-100"
                     >
                       <Download className="w-5 h-5" />
-                      <span className="text-[10px] uppercase tracking-widest">Audio</span>
+                      <span className="text-sm">음성 저장</span>
                     </button>
                     <button 
                       onClick={downloadScript}
-                      className="flex flex-col items-center gap-2 py-4 bg-gray-50 hover:bg-emerald-50 hover:text-emerald-700 rounded-2xl text-gray-500 font-bold transition-all border border-transparent hover:border-emerald-100"
+                      className="flex flex-col items-center gap-2 py-4 bg-gray-50 hover:bg-violet-50 hover:text-violet-700 rounded-2xl text-gray-500 font-bold transition-all border border-transparent hover:border-violet-100"
                     >
                       <FileDown className="w-5 h-5" />
-                      <span className="text-[10px] uppercase tracking-widest">Script</span>
+                      <span className="text-sm">대본 저장</span>
                     </button>
                     <button 
                       onClick={downloadSRT}
                       disabled={!srtContent}
-                      className="flex flex-col items-center gap-2 py-4 bg-gray-50 hover:bg-emerald-50 hover:text-emerald-700 rounded-2xl text-gray-500 font-bold transition-all border border-transparent hover:border-emerald-100 disabled:opacity-30 disabled:hover:bg-gray-50 disabled:hover:text-gray-500 disabled:hover:border-transparent"
+                      className="flex flex-col items-center gap-2 py-4 bg-gray-50 hover:bg-violet-50 hover:text-violet-700 rounded-2xl text-gray-500 font-bold transition-all border border-transparent hover:border-violet-100 disabled:opacity-30 disabled:hover:bg-gray-50 disabled:hover:text-gray-500 disabled:hover:border-transparent"
                     >
                       <FileText className="w-5 h-5" />
-                      <span className="text-[10px] uppercase tracking-widest">Subtitle</span>
+                      <span className="text-sm">예상 자막 저장</span>
                     </button>
                   </div>
                 </div>
@@ -665,76 +558,27 @@ export default function App() {
           )}
         </AnimatePresence>
 
-        {/* Footer */}
-        <footer className="mt-24 pb-12 text-center">
-          <div className="h-px w-24 bg-gradient-to-r from-transparent via-gray-200 to-transparent mx-auto mb-8" />
-          <p className="text-gray-400 text-[10px] tracking-[0.3em] uppercase font-bold mb-6">© 2026 ZoopsBooks. All rights reserved.</p>
-          <div className="flex items-center justify-center gap-8">
-            <div className="flex items-center gap-3 group">
-              <div className="w-2 h-2 bg-emerald-400 rounded-full shadow-[0_0_8px_rgba(52,211,153,0.6)] group-hover:scale-125 transition-transform" />
-              <span className="text-[11px] font-bold text-gray-500 tracking-wide uppercase">Studying 줍스 (Puck)</span>
-            </div>
-            <div className="flex items-center gap-3 group">
-              <div className="w-2 h-2 bg-emerald-400 rounded-full shadow-[0_0_8px_rgba(52,211,153,0.6)] group-hover:scale-125 transition-transform" />
-              <span className="text-[11px] font-bold text-gray-500 tracking-wide uppercase">Teaching 쌤 (Charon)</span>
-            </div>
-          </div>
-        </footer>
-      </div>
+        </div>
+        <footer className="cs-footer"><strong>ZoopsBooks</strong><span>WAV 음성 · TXT 대본 · SRT 예상 자막</span></footer>
+      </main>
 
-      {/* Settings Modal */}
-      <AnimatePresence>
-        {isSettingsOpen && (
-          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4">
-            <motion.div 
-              initial={{ opacity: 0 }}
-              animate={{ opacity: 1 }}
-              exit={{ opacity: 0 }}
-              onClick={() => apiKey && setIsSettingsOpen(false)}
-              className="absolute inset-0 bg-[#050505]/40 backdrop-blur-2xl"
-            />
-            <motion.div 
-              initial={{ opacity: 0, scale: 0.9, y: 40 }}
-              animate={{ opacity: 1, scale: 1, y: 0 }}
-              exit={{ opacity: 0, scale: 0.9, y: 40 }}
-              className="relative bg-white rounded-[48px] shadow-[0_32px_64px_-12px_rgba(0,0,0,0.15)] p-12 w-full max-w-md border border-gray-100 overflow-hidden"
-            >
-              <div className="absolute top-0 left-0 right-0 h-2 bg-gradient-to-r from-emerald-500 to-emerald-700" />
-              <h2 className="text-4xl font-serif font-bold mb-4 tracking-tight">API 설정</h2>
-              <p className="text-gray-400 mb-10 text-base font-medium leading-relaxed">Gemini AI의 마법을 시작하기 위해<br />API 키를 입력해주세요.</p>
-              
-              <div className="space-y-8">
-                <div className="space-y-4">
-                  <label className="text-[10px] font-bold uppercase tracking-[0.3em] text-gray-400 ml-1">Secure Gemini API Key</label>
-                  <div className="relative group">
-                    <input 
-                      type="password"
-                      value={apiKey}
-                      onChange={(e) => setApiKey(e.target.value)}
-                      placeholder="AI... (암호화되어 안전하게 저장됩니다)"
-                      className="w-full p-6 bg-gray-50 border border-gray-100 rounded-[24px] focus:ring-4 focus:ring-emerald-500/10 focus:border-emerald-500 outline-none transition-all font-mono text-sm shadow-inner"
-                    />
-                    <div className="absolute right-6 top-1/2 -translate-y-1/2 text-gray-200 group-focus-within:text-emerald-500 transition-colors">
-                      <Settings className="w-5 h-5" />
-                    </div>
-                  </div>
-                </div>
-                <button 
-                  onClick={() => setIsSettingsOpen(false)}
-                  disabled={!apiKey}
-                  className="w-full py-6 bg-[#1A1A1A] text-white rounded-[24px] font-bold text-xl hover:bg-black disabled:bg-gray-100 disabled:text-gray-300 transition-all shadow-2xl active:scale-[0.98] shadow-emerald-900/10"
-                >
-                  저장 및 시작하기
-                </button>
-                <div className="flex items-center justify-center gap-2 text-[10px] text-gray-400 font-bold uppercase tracking-widest">
-                  <span className="w-1 h-1 bg-emerald-500 rounded-full" />
-                  Local Storage Encrypted
-                </div>
-              </div>
-            </motion.div>
+      <dialog className="cs-dialog" ref={settingsRef} aria-labelledby="cs-api-title" onClose={() => setIsSettingsOpen(false)}>
+        <h2 id="cs-api-title">API 설정</h2>
+        <p>강의 생성에 사용할 Gemini API 키를 입력해 주세요.</p>
+        <form className="cs-key-form" onSubmit={event => {
+          event.preventDefault();
+          setApiKey(draftApiKey.trim());
+          setIsSettingsOpen(false);
+        }}>
+          <label htmlFor="cs-api-key">Gemini API 키</label>
+          <input id="cs-api-key" type="password" autoComplete="off" value={draftApiKey} onChange={event => setDraftApiKey(event.target.value)} required />
+          <small>키는 이 브라우저에 저장됩니다.</small>
+          <div className="cs-dialog-actions">
+            <button type="button" className="cs-api" onClick={() => setIsSettingsOpen(false)}>닫기</button>
+            <button type="submit" className="cs-run" disabled={!draftApiKey.trim()}>저장하기</button>
           </div>
-        )}
-      </AnimatePresence>
+        </form>
+      </dialog>
     </div>
   );
 }

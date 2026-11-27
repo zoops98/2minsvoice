@@ -19,13 +19,11 @@ import {
   Volume2
 } from 'lucide-react';
 import { motion, AnimatePresence } from 'motion/react';
-import { generateLectureAudio, makeLectureWav, PCM_BYTES_PER_SECOND, prepareLecture } from './lecture-audio';
-import { generateLongSoloLecture } from './long-solo-lecture';
+import { makeLectureWav, PCM_BYTES_PER_SECOND } from './lecture-audio';
+import { generateStyledLecture, STYLE_LABELS, type LectureStyle, type LectureLength } from './lecture-styles';
 import { generateSyncedSrt } from './lecture-subtitles';
 
 type FileType = 'image' | 'markdown' | 'html' | null;
-type LectureMode = 'podcast' | 'solo';
-type LectureLength = 2 | 3 | 5 | 10 | 15;
 
 const WAVE_BARS = [7, 14, 22, 13, 28, 46, 62, 42, 30, 45, 72, 91, 64, 46, 30, 21, 39, 57, 72, 49, 26, 36, 22, 11, 18, 9];
 
@@ -37,7 +35,8 @@ export default function App() {
   const [file, setFile] = useState<File | null>(null);
   const [fileType, setFileType] = useState<FileType>(null);
   const [lectureLength, setLectureLength] = useState<LectureLength>(2);
-  const [lectureMode, setLectureMode] = useState<LectureMode>('podcast');
+  const [chosenStyle, setChosenStyle] = useState<LectureStyle | null>(null);
+  const lectureStyle = chosenStyle ?? (fileType === 'html' ? 'notes' : 'podcast');
   const [status, setStatus] = useState<'idle' | 'analyzing' | 'generating_audio' | 'success' | 'error'>('idle');
   const [errorMessage, setErrorMessage] = useState<string>('');
   const [audioUrl, setAudioUrl] = useState<string | null>(null);
@@ -48,7 +47,7 @@ export default function App() {
   const [progress, setProgress] = useState(0);
   const [audioProgress, setAudioProgress] = useState('');
   const [audioDuration, setAudioDuration] = useState(0);
-  const [resultSettings, setResultSettings] = useState({ minutes: lectureLength, mode: lectureMode });
+  const [resultSettings, setResultSettings] = useState({ minutes: lectureLength, style: lectureStyle });
   const audioRef = useRef<HTMLAudioElement | null>(null);
 
   useEffect(() => {
@@ -75,12 +74,10 @@ export default function App() {
       setFile(selectedFile);
       if (selectedFile.type.startsWith('image/')) {
         setFileType('image');
-      } else if (selectedFile.name.endsWith('.md') || selectedFile.type === 'text/markdown') {
+      } else if (selectedFile.name.toLowerCase().endsWith('.md') || selectedFile.type === 'text/markdown') {
         setFileType('markdown');
-      } else if (selectedFile.name.endsWith('.html') || selectedFile.type === 'text/html') {
+      } else if (selectedFile.name.toLowerCase().endsWith('.html') || selectedFile.type === 'text/html') {
         setFileType('html');
-        // Auto-switch to solo mode if HTML is uploaded as it's likely a mock exam note
-        setLectureMode('solo');
       } else {
         setFile(null);
         e.target.value = '';
@@ -148,61 +145,11 @@ export default function App() {
         contentPart = { text };
       }
 
-      const getTargetChars = (len: LectureLength, mode: LectureMode) => {
-        if (mode === 'solo') {
-          if (len === 2) return '약 700자';
-          if (len === 3) return '약 1100자';
-          return `약 ${len * 360}자`;
-        } else {
-          if (len === 2) return '약 600자';
-          if (len === 3) return '약 950자';
-          return `약 ${len * 300}자`;
-        }
-      };
-
-      const scriptPrompt = lectureMode === 'podcast' ? `
-        당신은 전문 교육 팟캐스트 작가입니다. 
-        업로드된 내용을 바탕으로 학생과 선생님이 대화하는 ${lectureLength}분 분량의 교육용 스크립트를 작성하세요.
-        
-        규칙:
-        1. 각 발화는 새 줄에 '학생: [대사]' 또는 '선생님: [대사]'로 작성하세요. 화자 이름, 별명, 무대 지시, 제목은 넣지 마세요.
-        2. 학생은 궁금한 점을 짧고 자연스럽게 질문하고, 선생님은 명확하게 설명합니다. 대사 안에서도 학생을 이름이나 별명으로 부르지 마세요.
-        3. 청취자가 쉽게 이해할 수 있도록 핵심 내용을 대화로 풀어내세요.
-        4. ${getTargetChars(lectureLength, 'podcast')} 정도의 분량으로 작성하세요.
-        5. 한국어로 작성하세요.
-        6. 첫 대사는 반드시 '선생님: 강의 시작하겠습니다.'로 시작하고 인사, 자기소개, 잡담 없이 바로 본론으로 들어가세요. 이후에는 도입 인사를 반복하지 마세요.
-      ` : `
-        당신은 전문 수능/내신 영어 강사입니다. 
-        업로드된 필기 데이터(HTML/텍스트)를 바탕으로, 학생들에게 핵심 내용을 짚어주는 1인 강의 대본을 작성하세요.
-
-        규칙:
-        1. 각 발화는 새 줄에 '선생님: [대사]'로 작성하세요. 다른 인물, 이름, 별명, 무대 지시, 제목은 넣지 마세요.
-        2. 선생님은 친절하지만 핵심을 정확히 찌르는 명쾌한 어조를 사용합니다.
-        3. 자료 내의 구문 분석, 문법 포인트, 주제 및 요약 내용을 빠짐없이 설명에 녹여내세요.
-        4. 청취자가 필기 노트를 보고 있다고 가정하고 시각적인 설명(예: "여기 파란색 박스의 핵심 내용을 보시면...")을 곁들이세요.
-        5. 분량은 약 ${lectureLength}분 (${getTargetChars(lectureLength, 'solo')})에 해당하도록 한국어로 작성하세요.
-        6. 설명이 너무 빠르지 않게, 전문 강사처럼 문장 사이사이에 여유를 두고 차근차근 설명하는 어조로 작성하세요.
-        7. 첫 대사는 반드시 '선생님: 강의 시작하겠습니다.'로 시작하고 인사, 자기소개, 잡담 없이 바로 본론으로 들어가세요. 이후에는 도입 인사를 반복하지 마세요.
-      `;
-
-      const longSolo = lectureMode === 'solo' && (lectureLength === 10 || lectureLength === 15);
-      if (longSolo) setStatus('generating_audio');
-      const lecture = longSolo
-        ? { ...await generateLongSoloLecture(ai, apiKey, contentPart, lectureLength, setAudioProgress), dialogue: [] }
-        : {
-            ...prepareLecture((await ai.models.generateContent({
-              model: "gemini-3-flash-preview",
-              contents: [{ parts: [{ text: scriptPrompt }, contentPart] }],
-            })).text, lectureMode),
-            audioParts: null,
-          };
-
-      setScript(lecture.script);
-
+      const { script: generatedScript, audioParts } = await generateStyledLecture(
+        ai, apiKey, contentPart, lectureStyle, lectureLength, setAudioProgress,
+      );
+      setScript(generatedScript);
       setStatus('generating_audio');
-      const audioParts = lecture.audioParts ?? await generateLectureAudio(apiKey, lecture.dialogue, (current, total) => {
-        setAudioProgress(`음성 생성 중… (${current}/${total})`);
-      });
       const audioBytes = audioParts.reduce((sum, part) => sum + part.byteLength, 0);
       setAudioDuration(audioBytes / PCM_BYTES_PER_SECOND);
 
@@ -220,7 +167,7 @@ export default function App() {
       const blob = new Blob([makeLectureWav(audioParts)], { type: 'audio/wav' });
       const url = URL.createObjectURL(blob);
       setAudioUrl(url);
-      setResultSettings({ minutes: lectureLength, mode: lectureMode });
+      setResultSettings({ minutes: lectureLength, style: lectureStyle });
       setStatus('success');
     } catch (error: any) {
       console.error(error);
@@ -352,14 +299,17 @@ export default function App() {
             <fieldset className="cs-field" disabled={isGenerating}>
               <legend>강의 방식</legend>
               <div className="cs-mode-list">
-                <label className="cs-choice">
-                  <input type="radio" name="mode" value="podcast" checked={lectureMode === 'podcast'} onChange={() => setLectureMode('podcast')} />
-                  <strong>대화형 팟캐스트</strong><small>학생과 선생님의 대화</small>
-                </label>
-                <label className="cs-choice">
-                  <input type="radio" name="mode" value="solo" checked={lectureMode === 'solo'} onChange={() => setLectureMode('solo')} />
-                  <strong>필기 집중 강의</strong><small>선생님의 1인 설명</small>
-                </label>
+                {([
+                  ['notes', '필기 순서대로 문장과 표시를 짚어요'],
+                  ['overview', '글 전체의 주제와 흐름을 풀어요'],
+                  ['podcast', '학생과 선생님이 대화해요'],
+                ] as const).map(([style, description]) => (
+                  <label className="cs-choice" key={style}>
+                    <input type="radio" name="mode" value={style} checked={lectureStyle === style}
+                      onClick={() => setChosenStyle(style)} onChange={() => setChosenStyle(style)} />
+                    <strong>{STYLE_LABELS[style]}</strong><small>{description}</small>
+                  </label>
+                ))}
               </div>
             </fieldset>
             <fieldset className="cs-field" disabled={isGenerating}>
@@ -373,12 +323,12 @@ export default function App() {
                 ))}
               </div>
             </fieldset>
-            {lectureMode === 'solo' && lectureLength >= 10 && (
+            {lectureStyle === 'overview' && lectureLength >= 10 && (
               <p className="cs-plan">주제 → 핵심 문장과 구문 → 어휘와 해석 → 요약</p>
             )}
             <button className="cs-run" type="submit" disabled={isGenerating}>
               {isGenerating ? <Loader2 className="cs-spinner" aria-hidden="true" /> : null}
-              <span role="status">{isGenerating ? (audioProgress || '자료 분석 중…') : `${lectureLength}분 강의 만들기`}</span>
+              <span aria-live="polite">{isGenerating ? (audioProgress || '자료 분석 중…') : `${lectureLength}분 강의 만들기`}</span>
               {!isGenerating && <span aria-hidden="true">→</span>}
             </button>
           </form>
@@ -398,7 +348,7 @@ export default function App() {
               </div>
               <h3 className="text-4xl font-serif font-bold text-violet-900 mb-4 tracking-tight">강의가 완성되었습니다!</h3>
               <p className="text-violet-700/70 font-serif italic text-xl mb-12 max-w-sm mx-auto">
-                {resultSettings.mode === 'podcast' ? '학생과 선생님의 대화형 강의를 들어보세요.' : '필기 핵심 내용을 짚어주는 1인 집중 강의입니다.'}
+                {STYLE_LABELS[resultSettings.style]}
               </p>
               
               <div className="w-full bg-white rounded-[24px] p-4 sm:p-8 flex flex-col gap-10 shadow-xl shadow-gray-200/50 border border-violet-50">

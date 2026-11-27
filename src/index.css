@@ -120,7 +120,7 @@
 .cs-app .cs-field { border: 0; padding: 0; margin: 0; min-width: 0; }
 .cs-app .cs-field legend { padding: 0; margin-bottom: 6px; font-size: 13px; font-weight: 750; }
 .cs-app .cs-mode-list, .cs-app .cs-durations { display: grid; gap: 7px; }
-.cs-app .cs-mode-list { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.cs-app .cs-mode-list { grid-template-columns: repeat(3, minmax(0, 1fr)); }
 .cs-app .cs-durations { grid-template-columns: repeat(5, minmax(0, 1fr)); }
 .cs-app .cs-choice, .cs-app .cs-length {
   position: relative; min-height: 44px; border: 1px solid var(--cs-line); border-radius: 8px;
@@ -166,6 +166,8 @@
   .cs-app .cs-upload { min-height: 118px; }
 }
 @media (max-width: 440px) {
+  .cs-app .cs-mode-list { grid-template-columns: 1fr; }
+  .cs-app .cs-choice { flex-direction: row; align-items: center; gap: 9px; }
   .cs-app .cs-hero { grid-template-columns: 1fr; }
   .cs-app .cs-art { height: 84px; margin-top: 4px; }
   .cs-app .cs-wave { width: 86%; height: 52px; }
